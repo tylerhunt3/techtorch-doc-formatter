@@ -3,9 +3,9 @@ from docx import Document as ReadDocument
 from docx.shared import Pt, Inches, Twips, RGBColor
 from docx.enum.text import WD_ALIGN_PARAGRAPH
 from docx.enum.table import WD_TABLE_ALIGNMENT
-from docx.oxml.ns import qn, nsmap
+from docx.oxml.ns import qn
 from docx.oxml import OxmlElement
-from lxml import etree
+import xml.etree.ElementTree as ET
 import io
 import re
 import zipfile
@@ -41,15 +41,6 @@ SIZES = {
     "HEADER_FOOTER": Pt(8),
 }
 
-# XML namespaces for parsing
-NAMESPACES = {
-    'w': 'http://schemas.openxmlformats.org/wordprocessingml/2006/main',
-    'wps': 'http://schemas.microsoft.com/office/word/2010/wordprocessingShape',
-    'a': 'http://schemas.openxmlformats.org/drawingml/2006/main',
-    'r': 'http://schemas.openxmlformats.org/officeDocument/2006/relationships',
-    'wp': 'http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing',
-}
-
 
 # ============================================================================
 # CONTENT EXTRACTION - Enhanced to handle text boxes and code blocks
@@ -58,8 +49,9 @@ NAMESPACES = {
 def extract_text_from_xml_element(element):
     """Extract all text from an XML element and its children."""
     texts = []
-    for text_elem in element.iter('{http://schemas.openxmlformats.org/wordprocessingml/2006/main}t'):
-        if text_elem.text:
+    # Handle the namespace prefix for Word XML
+    for text_elem in element.iter():
+        if text_elem.tag.endswith('}t') and text_elem.text:
             texts.append(text_elem.text)
     return ''.join(texts)
 
@@ -68,28 +60,39 @@ def extract_textboxes_from_docx(docx_bytes):
     """Extract text boxes (code blocks) from the document XML."""
     textboxes = []
     
-    with zipfile.ZipFile(io.BytesIO(docx_bytes)) as zf:
-        if 'word/document.xml' in zf.namelist():
-            xml_content = zf.read('word/document.xml')
-            root = etree.fromstring(xml_content)
-            
-            # Find all text box content
-            for txbx in root.iter('{http://schemas.microsoft.com/office/word/2010/wordprocessingShape}txbx'):
-                lines = []
-                for para in txbx.iter('{http://schemas.openxmlformats.org/wordprocessingml/2006/main}p'):
-                    text = extract_text_from_xml_element(para)
-                    if text:
-                        lines.append(text)
+    try:
+        with zipfile.ZipFile(io.BytesIO(docx_bytes)) as zf:
+            if 'word/document.xml' in zf.namelist():
+                xml_content = zf.read('word/document.xml')
                 
-                if lines:
-                    # Check if this looks like code (has SQL keywords, indentation, etc.)
-                    full_text = '\n'.join(lines)
-                    if is_code_block(full_text):
-                        textboxes.append({
-                            "type": "code_block",
-                            "lines": lines,
-                            "text": full_text
-                        })
+                # Parse XML
+                root = ET.fromstring(xml_content)
+                
+                # Find all text box content - look for txbx elements
+                # The namespace for wordprocessingShape
+                wps_ns = '{http://schemas.microsoft.com/office/word/2010/wordprocessingShape}'
+                w_ns = '{http://schemas.openxmlformats.org/wordprocessingml/2006/main}'
+                
+                for txbx in root.iter(f'{wps_ns}txbx'):
+                    lines = []
+                    for para in txbx.iter(f'{w_ns}p'):
+                        para_texts = []
+                        for t in para.iter(f'{w_ns}t'):
+                            if t.text:
+                                para_texts.append(t.text)
+                        if para_texts:
+                            lines.append(''.join(para_texts))
+                    
+                    if lines:
+                        full_text = '\n'.join(lines)
+                        if is_code_block(full_text):
+                            textboxes.append({
+                                "type": "code_block",
+                                "lines": lines,
+                                "text": full_text
+                            })
+    except Exception as e:
+        st.warning(f"Note: Could not extract text boxes: {str(e)}")
     
     return textboxes
 
@@ -106,7 +109,7 @@ def is_code_block(text):
     text_upper = text.upper()
     matches = sum(1 for indicator in code_indicators if indicator.upper() in text_upper)
     
-    # Also check for indentation patterns (multiple spaces at start of lines)
+    # Also check for indentation patterns
     lines = text.split('\n')
     indented_lines = sum(1 for line in lines if line.startswith('    ') or line.startswith('\t'))
     
@@ -118,7 +121,6 @@ def is_section_header(text, is_bold=False, color=None):
     text = text.strip()
     
     # Check for numbered section patterns
-    # "1. Something" or "1.1 Something" or "1.1.1 Something"
     level1_pattern = r'^(\d+)\.\s+[A-Z]'
     level2_pattern = r'^(\d+)\.(\d+)\s+[A-Z]'
     level3_pattern = r'^(\d+)\.(\d+)\.(\d+)\s+[A-Z]'
@@ -138,13 +140,6 @@ def is_section_header(text, is_bold=False, color=None):
     for keyword in header_keywords:
         if text == keyword or text.startswith(keyword + ':'):
             return "heading1"
-    
-    # If it's bold and short, might be a header
-    if is_bold and len(text) < 80 and not text.endswith('.'):
-        # But not if it starts with "Result:" or similar
-        if text.startswith('Result:') or text.startswith('Total') or text.startswith('Direct'):
-            return None
-        return "heading1"
     
     return None
 
@@ -173,18 +168,6 @@ def is_bullet_point(para, text):
     return False
 
 
-def get_paragraph_color(para):
-    """Extract the color from a paragraph's first run."""
-    if para.runs:
-        run = para.runs[0]
-        rPr = run._element.find(qn('w:rPr'))
-        if rPr is not None:
-            color = rPr.find(qn('w:color'))
-            if color is not None:
-                return color.get(qn('w:val'))
-    return None
-
-
 def extract_content_from_docx(uploaded_file):
     """Extract all content from uploaded Word document."""
     # Read file bytes for text box extraction
@@ -193,7 +176,6 @@ def extract_content_from_docx(uploaded_file):
     
     # Extract text boxes (code blocks)
     textboxes = extract_textboxes_from_docx(file_bytes)
-    textbox_texts = [tb['text'] for tb in textboxes]
     
     # Read document with python-docx
     doc = ReadDocument(uploaded_file)
@@ -212,7 +194,6 @@ def extract_content_from_docx(uploaded_file):
         
         # Get formatting info
         is_bold = para.runs and para.runs[0].bold if para.runs else False
-        color = get_paragraph_color(para)
         style_name = para.style.name.lower() if para.style else ""
         
         # Determine content type
@@ -222,7 +203,7 @@ def extract_content_from_docx(uploaded_file):
             clean_text = re.sub(r'^[•\-*–]\s*', '', text)
             content.append({"type": "bullet", "text": clean_text})
         else:
-            header_type = is_section_header(text, is_bold, color)
+            header_type = is_section_header(text, is_bold)
             if header_type:
                 content.append({"type": header_type, "text": text})
             else:
@@ -240,7 +221,6 @@ def extract_content_from_docx(uploaded_file):
             row_data = []
             for cell in row.cells:
                 cell_text = cell.text.strip()
-                # Avoid duplicates from merged cells
                 if not row_data or cell_text != row_data[-1]:
                     row_data.append(cell_text)
             if row_data:
@@ -278,27 +258,8 @@ def set_cell_borders(cell, color="CCCCCC", size="4"):
     tcPr.append(tcBorders)
 
 
-def set_cell_border_side(cell, side, color, size):
-    """Set a specific border side for a cell."""
-    tc = cell._tc
-    tcPr = tc.get_or_add_tcPr()
-    
-    # Find or create tcBorders
-    tcBorders = tcPr.find(qn('w:tcBorders'))
-    if tcBorders is None:
-        tcBorders = OxmlElement('w:tcBorders')
-        tcPr.append(tcBorders)
-    
-    border = OxmlElement(f'w:{side}')
-    border.set(qn('w:val'), 'single')
-    border.set(qn('w:sz'), str(size))
-    border.set(qn('w:color'), color)
-    tcBorders.append(border)
-
-
 def create_code_block_table(doc, code_lines):
     """Create a formatted code block as a table."""
-    # Create single-column table
     table = doc.add_table(rows=len(code_lines), cols=1)
     table.alignment = WD_TABLE_ALIGNMENT.LEFT
     
@@ -308,7 +269,7 @@ def create_code_block_table(doc, code_lines):
         # Set cell background
         set_cell_shading(cell, COLORS["CODE_BG"])
         
-        # Set borders: thick left accent, thin others
+        # Set borders
         tc = cell._tc
         tcPr = tc.get_or_add_tcPr()
         tcBorders = OxmlElement('w:tcBorders')
@@ -316,7 +277,7 @@ def create_code_block_table(doc, code_lines):
         # Left border - thick accent
         left = OxmlElement('w:left')
         left.set(qn('w:val'), 'single')
-        left.set(qn('w:sz'), '24')  # 3pt thick
+        left.set(qn('w:sz'), '24')
         left.set(qn('w:color'), COLORS["CODE_ACCENT"])
         tcBorders.append(left)
         
@@ -376,16 +337,13 @@ def create_data_table(doc, table_data):
             cell = row.cells[col_idx]
             cell.text = cell_text
             
-            # Set borders
             set_cell_borders(cell, COLORS["TABLE_BORDER"])
             
-            # Format text
             for para in cell.paragraphs:
                 for run in para.runs:
                     run.font.name = 'Aptos'
                     run.font.size = SIZES["BODY"]
             
-            # Header row styling
             if row_idx == 0:
                 set_cell_shading(cell, COLORS["TABLE_HEADER_BG"])
                 for para in cell.paragraphs:
@@ -432,14 +390,13 @@ def create_formatted_document(content, doc_title, organization="TechTorch Inc.")
     title_run.font.bold = True
     title_run.font.color.rgb = COLORS["BODY"]
     
-    # Subtitle (if first content item is a title with different text)
+    # Find subtitle from content
     subtitle_text = None
     for item in content:
         if item["type"] == "title" and item["text"] != doc_title:
             subtitle_text = item["text"]
             break
         elif item["type"] == "heading1":
-            # Use first heading as subtitle
             subtitle_text = item["text"]
             break
     
@@ -480,13 +437,13 @@ def create_formatted_document(content, doc_title, organization="TechTorch Inc.")
     doc.add_page_break()
     
     # ---- MAIN CONTENT ----
-    skip_next_heading = subtitle_text is not None  # Skip first heading if used as subtitle
+    skip_next_heading = subtitle_text is not None
     
     for item in content:
         item_type = item["type"]
         
         if item_type == "title":
-            continue  # Skip titles, already on title page
+            continue
         
         elif item_type == "heading1":
             if skip_next_heading:
@@ -509,11 +466,7 @@ def create_formatted_document(content, doc_title, organization="TechTorch Inc.")
         elif item_type == "paragraph":
             para = doc.add_paragraph()
             para.paragraph_format.space_after = Twips(160)
-            
-            # Handle bold text within paragraph
-            text = item["text"]
-            # Simple approach: just add as regular text
-            run = para.add_run(text)
+            run = para.add_run(item["text"])
             run.font.name = 'Aptos'
             run.font.size = SIZES["BODY"]
             run.font.color.rgb = COLORS["BODY"]
@@ -527,14 +480,14 @@ def create_formatted_document(content, doc_title, organization="TechTorch Inc.")
             run.font.color.rgb = COLORS["BODY"]
         
         elif item_type == "code_block":
-            doc.add_paragraph()  # Space before
+            doc.add_paragraph()
             create_code_block_table(doc, item["lines"])
-            doc.add_paragraph()  # Space after
+            doc.add_paragraph()
         
         elif item_type == "table":
-            doc.add_paragraph()  # Space before
+            doc.add_paragraph()
             create_data_table(doc, item["data"])
-            doc.add_paragraph()  # Space after
+            doc.add_paragraph()
     
     # ---- END OF DOCUMENT ----
     end_para = doc.add_paragraph()
@@ -566,19 +519,6 @@ st.set_page_config(
     page_icon="📄",
     layout="centered"
 )
-
-# Custom CSS
-st.markdown("""
-<style>
-    .stButton > button {
-        width: 100%;
-    }
-    .upload-text {
-        font-size: 14px;
-        color: #666;
-    }
-</style>
-""", unsafe_allow_html=True)
 
 # Header
 st.title("📄 TechTorch Document Formatter")
