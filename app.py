@@ -3,25 +3,33 @@ from docx import Document as ReadDocument
 from docx.shared import Pt, Inches, Twips, RGBColor
 from docx.enum.text import WD_ALIGN_PARAGRAPH
 from docx.enum.table import WD_TABLE_ALIGNMENT
-from docx.oxml.ns import qn
+from docx.oxml.ns import qn, nsmap
 from docx.oxml import OxmlElement
+from lxml import etree
 import io
 import re
+import zipfile
 from datetime import datetime
 
-# --- CONFIGURATION ---
-# TechTorch Color Palette (RGB values)
+# ============================================================================
+# CONFIGURATION - TechTorch Standards
+# ============================================================================
+
 COLORS = {
-    "HEADING1": RGBColor(0x1F, 0x4E, 0x79),      # Dark blue
-    "HEADING2": RGBColor(0x2E, 0x75, 0xB6),      # Medium blue
-    "HEADING3": RGBColor(0x40, 0x40, 0x40),      # Dark gray
-    "BODY": RGBColor(0x00, 0x00, 0x00),          # Black
-    "SECONDARY": RGBColor(0x66, 0x66, 0x66),     # Gray
-    "CODE_TEXT": RGBColor(0x2E, 0x2E, 0x2E),     # Near-black
-    "WHITE": RGBColor(0xFF, 0xFF, 0xFF),         # White
+    "HEADING1": RGBColor(0x1F, 0x4E, 0x79),
+    "HEADING2": RGBColor(0x2E, 0x75, 0xB6),
+    "HEADING3": RGBColor(0x40, 0x40, 0x40),
+    "BODY": RGBColor(0x00, 0x00, 0x00),
+    "SECONDARY": RGBColor(0x66, 0x66, 0x66),
+    "CODE_TEXT": RGBColor(0x2E, 0x2E, 0x2E),
+    "WHITE": RGBColor(0xFF, 0xFF, 0xFF),
+    "TABLE_HEADER_BG": "1F4E79",
+    "TABLE_BORDER": "CCCCCC",
+    "CODE_BG": "F5F5F5",
+    "CODE_BORDER": "BFBFBF",
+    "CODE_ACCENT": "1F4E79",
 }
 
-# Font sizes
 SIZES = {
     "TITLE": Pt(24),
     "SUBTITLE": Pt(14),
@@ -33,57 +41,219 @@ SIZES = {
     "HEADER_FOOTER": Pt(8),
 }
 
-# --- HELPER FUNCTIONS ---
+# XML namespaces for parsing
+NAMESPACES = {
+    'w': 'http://schemas.openxmlformats.org/wordprocessingml/2006/main',
+    'wps': 'http://schemas.microsoft.com/office/word/2010/wordprocessingShape',
+    'a': 'http://schemas.openxmlformats.org/drawingml/2006/main',
+    'r': 'http://schemas.openxmlformats.org/officeDocument/2006/relationships',
+    'wp': 'http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing',
+}
+
+
+# ============================================================================
+# CONTENT EXTRACTION - Enhanced to handle text boxes and code blocks
+# ============================================================================
+
+def extract_text_from_xml_element(element):
+    """Extract all text from an XML element and its children."""
+    texts = []
+    for text_elem in element.iter('{http://schemas.openxmlformats.org/wordprocessingml/2006/main}t'):
+        if text_elem.text:
+            texts.append(text_elem.text)
+    return ''.join(texts)
+
+
+def extract_textboxes_from_docx(docx_bytes):
+    """Extract text boxes (code blocks) from the document XML."""
+    textboxes = []
+    
+    with zipfile.ZipFile(io.BytesIO(docx_bytes)) as zf:
+        if 'word/document.xml' in zf.namelist():
+            xml_content = zf.read('word/document.xml')
+            root = etree.fromstring(xml_content)
+            
+            # Find all text box content
+            for txbx in root.iter('{http://schemas.microsoft.com/office/word/2010/wordprocessingShape}txbx'):
+                lines = []
+                for para in txbx.iter('{http://schemas.openxmlformats.org/wordprocessingml/2006/main}p'):
+                    text = extract_text_from_xml_element(para)
+                    if text:
+                        lines.append(text)
+                
+                if lines:
+                    # Check if this looks like code (has SQL keywords, indentation, etc.)
+                    full_text = '\n'.join(lines)
+                    if is_code_block(full_text):
+                        textboxes.append({
+                            "type": "code_block",
+                            "lines": lines,
+                            "text": full_text
+                        })
+    
+    return textboxes
+
+
+def is_code_block(text):
+    """Determine if text looks like a code block."""
+    code_indicators = [
+        'SELECT', 'FROM', 'WHERE', 'INSERT', 'UPDATE', 'DELETE',  # SQL
+        'VAR', 'RETURN', 'IF', 'THEN', 'ELSE',  # DAX/Programming
+        'def ', 'class ', 'import ', 'function',  # Python/JS
+        '= {', '=> ', '};', '();',  # Code syntax
+    ]
+    
+    text_upper = text.upper()
+    matches = sum(1 for indicator in code_indicators if indicator.upper() in text_upper)
+    
+    # Also check for indentation patterns (multiple spaces at start of lines)
+    lines = text.split('\n')
+    indented_lines = sum(1 for line in lines if line.startswith('    ') or line.startswith('\t'))
+    
+    return matches >= 2 or indented_lines >= 3
+
+
+def is_section_header(text, is_bold=False, color=None):
+    """Determine if text is a section header."""
+    text = text.strip()
+    
+    # Check for numbered section patterns
+    # "1. Something" or "1.1 Something" or "1.1.1 Something"
+    level1_pattern = r'^(\d+)\.\s+[A-Z]'
+    level2_pattern = r'^(\d+)\.(\d+)\s+[A-Z]'
+    level3_pattern = r'^(\d+)\.(\d+)\.(\d+)\s+[A-Z]'
+    
+    if re.match(level3_pattern, text):
+        return "heading3"
+    if re.match(level2_pattern, text):
+        return "heading2"
+    if re.match(level1_pattern, text):
+        return "heading1"
+    
+    # Check for common header words without numbers
+    header_keywords = ['Summary', 'Conclusion', 'Overview', 'Introduction', 
+                       'Background', 'Results', 'Analysis', 'Recommendations',
+                       'Final Summary', 'Next Steps']
+    
+    for keyword in header_keywords:
+        if text == keyword or text.startswith(keyword + ':'):
+            return "heading1"
+    
+    # If it's bold and short, might be a header
+    if is_bold and len(text) < 80 and not text.endswith('.'):
+        # But not if it starts with "Result:" or similar
+        if text.startswith('Result:') or text.startswith('Total') or text.startswith('Direct'):
+            return None
+        return "heading1"
+    
+    return None
+
+
+def is_bullet_point(para, text):
+    """Determine if paragraph is a bullet point."""
+    # Check style name
+    if para.style and 'list' in para.style.name.lower():
+        return True
+    
+    # Check for bullet characters at start
+    if text.startswith(('•', '-', '*', '–')):
+        return True
+    
+    # Check for "Result:" pattern which should be a bullet
+    if text.startswith('Result:'):
+        return True
+    
+    # Check XML for numbering
+    pPr = para._element.find(qn('w:pPr'))
+    if pPr is not None:
+        numPr = pPr.find(qn('w:numPr'))
+        if numPr is not None:
+            return True
+    
+    return False
+
+
+def get_paragraph_color(para):
+    """Extract the color from a paragraph's first run."""
+    if para.runs:
+        run = para.runs[0]
+        rPr = run._element.find(qn('w:rPr'))
+        if rPr is not None:
+            color = rPr.find(qn('w:color'))
+            if color is not None:
+                return color.get(qn('w:val'))
+    return None
+
 
 def extract_content_from_docx(uploaded_file):
-    """Extract text content from uploaded Word document."""
+    """Extract all content from uploaded Word document."""
+    # Read file bytes for text box extraction
+    file_bytes = uploaded_file.read()
+    uploaded_file.seek(0)  # Reset for python-docx
+    
+    # Extract text boxes (code blocks)
+    textboxes = extract_textboxes_from_docx(file_bytes)
+    textbox_texts = [tb['text'] for tb in textboxes]
+    
+    # Read document with python-docx
     doc = ReadDocument(uploaded_file)
     content = []
     
+    # Track which textbox we're looking for
+    textbox_index = 0
+    
     for para in doc.paragraphs:
         text = para.text.strip()
-        if text:
-            # Try to detect heading level based on style or formatting
-            style_name = para.style.name.lower() if para.style else ""
-            
-            if "heading 1" in style_name or (para.runs and para.runs[0].bold and len(text) < 100):
-                # Check if it looks like a section header
-                if re.match(r'^\d+\.?\s+\w+', text) or len(text) < 80:
-                    content.append({"type": "heading1", "text": text})
-                else:
-                    content.append({"type": "paragraph", "text": text})
-            elif "heading 2" in style_name:
-                content.append({"type": "heading2", "text": text})
-            elif "heading 3" in style_name:
-                content.append({"type": "heading3", "text": text})
-            elif "title" in style_name:
-                content.append({"type": "title", "text": text})
+        if not text:
+            continue
+        
+        # Check if this paragraph mentions a query (insert code block after it)
+        mentions_query = 'following' in text.lower() and ('query' in text.lower() or 'soql' in text.lower())
+        
+        # Get formatting info
+        is_bold = para.runs and para.runs[0].bold if para.runs else False
+        color = get_paragraph_color(para)
+        style_name = para.style.name.lower() if para.style else ""
+        
+        # Determine content type
+        if 'title' in style_name:
+            content.append({"type": "title", "text": text})
+        elif is_bullet_point(para, text):
+            clean_text = re.sub(r'^[•\-*–]\s*', '', text)
+            content.append({"type": "bullet", "text": clean_text})
+        else:
+            header_type = is_section_header(text, is_bold, color)
+            if header_type:
+                content.append({"type": header_type, "text": text})
             else:
-                # Check for bullet points
-                if text.startswith(("-", "•", "*")) or para.style.name == "List Paragraph":
-                    clean_text = re.sub(r'^[-•*]\s*', '', text)
-                    content.append({"type": "bullet", "text": clean_text})
-                # Check for numbered items
-                elif re.match(r'^\d+\.\s+', text) and len(text) < 100:
-                    content.append({"type": "heading1", "text": text})
-                elif re.match(r'^\d+\.\d+\s+', text):
-                    content.append({"type": "heading2", "text": text})
-                elif re.match(r'^\d+\.\d+\.\d+\s+', text):
-                    content.append({"type": "heading3", "text": text})
-                else:
-                    content.append({"type": "paragraph", "text": text})
+                content.append({"type": "paragraph", "text": text})
+        
+        # Insert code block if this paragraph mentions a query
+        if mentions_query and textbox_index < len(textboxes):
+            content.append(textboxes[textbox_index])
+            textbox_index += 1
     
-    # Also extract tables
+    # Extract tables
     for table in doc.tables:
         table_data = []
         for row in table.rows:
-            row_data = [cell.text.strip() for cell in row.cells]
-            table_data.append(row_data)
+            row_data = []
+            for cell in row.cells:
+                cell_text = cell.text.strip()
+                # Avoid duplicates from merged cells
+                if not row_data or cell_text != row_data[-1]:
+                    row_data.append(cell_text)
+            if row_data:
+                table_data.append(row_data)
         if table_data:
             content.append({"type": "table", "data": table_data})
     
     return content
 
+
+# ============================================================================
+# DOCUMENT CREATION - Full TechTorch formatting
+# ============================================================================
 
 def set_cell_shading(cell, color_hex):
     """Set background color for a table cell."""
@@ -108,30 +278,148 @@ def set_cell_borders(cell, color="CCCCCC", size="4"):
     tcPr.append(tcBorders)
 
 
+def set_cell_border_side(cell, side, color, size):
+    """Set a specific border side for a cell."""
+    tc = cell._tc
+    tcPr = tc.get_or_add_tcPr()
+    
+    # Find or create tcBorders
+    tcBorders = tcPr.find(qn('w:tcBorders'))
+    if tcBorders is None:
+        tcBorders = OxmlElement('w:tcBorders')
+        tcPr.append(tcBorders)
+    
+    border = OxmlElement(f'w:{side}')
+    border.set(qn('w:val'), 'single')
+    border.set(qn('w:sz'), str(size))
+    border.set(qn('w:color'), color)
+    tcBorders.append(border)
+
+
+def create_code_block_table(doc, code_lines):
+    """Create a formatted code block as a table."""
+    # Create single-column table
+    table = doc.add_table(rows=len(code_lines), cols=1)
+    table.alignment = WD_TABLE_ALIGNMENT.LEFT
+    
+    for i, line in enumerate(code_lines):
+        cell = table.rows[i].cells[0]
+        
+        # Set cell background
+        set_cell_shading(cell, COLORS["CODE_BG"])
+        
+        # Set borders: thick left accent, thin others
+        tc = cell._tc
+        tcPr = tc.get_or_add_tcPr()
+        tcBorders = OxmlElement('w:tcBorders')
+        
+        # Left border - thick accent
+        left = OxmlElement('w:left')
+        left.set(qn('w:val'), 'single')
+        left.set(qn('w:sz'), '24')  # 3pt thick
+        left.set(qn('w:color'), COLORS["CODE_ACCENT"])
+        tcBorders.append(left)
+        
+        # Right border
+        right = OxmlElement('w:right')
+        right.set(qn('w:val'), 'single')
+        right.set(qn('w:sz'), '4')
+        right.set(qn('w:color'), COLORS["CODE_BORDER"])
+        tcBorders.append(right)
+        
+        # Top border (only first row)
+        if i == 0:
+            top = OxmlElement('w:top')
+            top.set(qn('w:val'), 'single')
+            top.set(qn('w:sz'), '4')
+            top.set(qn('w:color'), COLORS["CODE_BORDER"])
+            tcBorders.append(top)
+        
+        # Bottom border (only last row)
+        if i == len(code_lines) - 1:
+            bottom = OxmlElement('w:bottom')
+            bottom.set(qn('w:val'), 'single')
+            bottom.set(qn('w:sz'), '4')
+            bottom.set(qn('w:color'), COLORS["CODE_BORDER"])
+            tcBorders.append(bottom)
+        
+        tcPr.append(tcBorders)
+        
+        # Add text
+        para = cell.paragraphs[0]
+        para.paragraph_format.space_before = Twips(20)
+        para.paragraph_format.space_after = Twips(20)
+        run = para.add_run(line)
+        run.font.name = 'Consolas'
+        run.font.size = SIZES["CODE"]
+        run.font.color.rgb = COLORS["CODE_TEXT"]
+    
+    return table
+
+
+def create_data_table(doc, table_data):
+    """Create a formatted data table."""
+    if not table_data:
+        return None
+    
+    num_rows = len(table_data)
+    num_cols = len(table_data[0])
+    
+    table = doc.add_table(rows=num_rows, cols=num_cols)
+    table.alignment = WD_TABLE_ALIGNMENT.CENTER
+    
+    for row_idx, row_data in enumerate(table_data):
+        row = table.rows[row_idx]
+        for col_idx, cell_text in enumerate(row_data):
+            if col_idx >= len(row.cells):
+                continue
+            cell = row.cells[col_idx]
+            cell.text = cell_text
+            
+            # Set borders
+            set_cell_borders(cell, COLORS["TABLE_BORDER"])
+            
+            # Format text
+            for para in cell.paragraphs:
+                for run in para.runs:
+                    run.font.name = 'Aptos'
+                    run.font.size = SIZES["BODY"]
+            
+            # Header row styling
+            if row_idx == 0:
+                set_cell_shading(cell, COLORS["TABLE_HEADER_BG"])
+                for para in cell.paragraphs:
+                    para.alignment = WD_ALIGN_PARAGRAPH.CENTER
+                    for run in para.runs:
+                        run.font.bold = True
+                        run.font.color.rgb = COLORS["WHITE"]
+    
+    return table
+
+
 def create_formatted_document(content, doc_title, organization="TechTorch Inc."):
-    """Create a new formatted Word document."""
+    """Create a professionally formatted Word document."""
     doc = ReadDocument()
     
-    # Set default font for document
+    # Configure default styles
     style = doc.styles['Normal']
     style.font.name = 'Aptos'
     style.font.size = SIZES["BODY"]
     style.font.color.rgb = COLORS["BODY"]
     
-    # Set up Heading styles
-    for i, (style_name, size, color) in enumerate([
+    # Configure heading styles
+    for style_name, size, color in [
         ('Heading 1', SIZES["HEADING1"], COLORS["HEADING1"]),
         ('Heading 2', SIZES["HEADING2"], COLORS["HEADING2"]),
         ('Heading 3', SIZES["HEADING3"], COLORS["HEADING3"]),
-    ]):
+    ]:
         heading_style = doc.styles[style_name]
         heading_style.font.name = 'Aptos'
         heading_style.font.size = size
         heading_style.font.color.rgb = color
         heading_style.font.bold = True
     
-    # --- TITLE PAGE ---
-    # Add spacing at top
+    # ---- TITLE PAGE ----
     for _ in range(4):
         doc.add_paragraph()
     
@@ -143,6 +431,25 @@ def create_formatted_document(content, doc_title, organization="TechTorch Inc.")
     title_run.font.size = SIZES["TITLE"]
     title_run.font.bold = True
     title_run.font.color.rgb = COLORS["BODY"]
+    
+    # Subtitle (if first content item is a title with different text)
+    subtitle_text = None
+    for item in content:
+        if item["type"] == "title" and item["text"] != doc_title:
+            subtitle_text = item["text"]
+            break
+        elif item["type"] == "heading1":
+            # Use first heading as subtitle
+            subtitle_text = item["text"]
+            break
+    
+    if subtitle_text and subtitle_text != doc_title:
+        subtitle_para = doc.add_paragraph()
+        subtitle_para.alignment = WD_ALIGN_PARAGRAPH.CENTER
+        subtitle_run = subtitle_para.add_run(subtitle_text)
+        subtitle_run.font.name = 'Aptos'
+        subtitle_run.font.size = SIZES["SUBTITLE"]
+        subtitle_run.font.color.rgb = COLORS["BODY"]
     
     # Organization
     org_para = doc.add_paragraph()
@@ -169,80 +476,67 @@ def create_formatted_document(content, doc_title, organization="TechTorch Inc.")
     version_run.font.size = SIZES["BODY"]
     version_run.font.color.rgb = COLORS["SECONDARY"]
     
-    # Page break after title page
+    # Page break
     doc.add_page_break()
     
-    # --- MAIN CONTENT ---
+    # ---- MAIN CONTENT ----
+    skip_next_heading = subtitle_text is not None  # Skip first heading if used as subtitle
+    
     for item in content:
-        if item["type"] == "title":
-            # Skip title in body since we added it to title page
-            continue
-            
-        elif item["type"] == "heading1":
+        item_type = item["type"]
+        
+        if item_type == "title":
+            continue  # Skip titles, already on title page
+        
+        elif item_type == "heading1":
+            if skip_next_heading:
+                skip_next_heading = False
+                continue
             para = doc.add_paragraph(item["text"], style='Heading 1')
             para.paragraph_format.space_before = Twips(300)
             para.paragraph_format.space_after = Twips(100)
-            
-        elif item["type"] == "heading2":
+        
+        elif item_type == "heading2":
             para = doc.add_paragraph(item["text"], style='Heading 2')
             para.paragraph_format.space_before = Twips(200)
             para.paragraph_format.space_after = Twips(80)
-            
-        elif item["type"] == "heading3":
+        
+        elif item_type == "heading3":
             para = doc.add_paragraph(item["text"], style='Heading 3')
             para.paragraph_format.space_before = Twips(160)
             para.paragraph_format.space_after = Twips(60)
-            
-        elif item["type"] == "paragraph":
+        
+        elif item_type == "paragraph":
             para = doc.add_paragraph()
             para.paragraph_format.space_after = Twips(160)
-            run = para.add_run(item["text"])
+            
+            # Handle bold text within paragraph
+            text = item["text"]
+            # Simple approach: just add as regular text
+            run = para.add_run(text)
             run.font.name = 'Aptos'
             run.font.size = SIZES["BODY"]
             run.font.color.rgb = COLORS["BODY"]
-            
-        elif item["type"] == "bullet":
+        
+        elif item_type == "bullet":
             para = doc.add_paragraph(style='List Bullet')
             para.paragraph_format.left_indent = Twips(720)
             run = para.add_run(item["text"])
             run.font.name = 'Aptos'
             run.font.size = SIZES["BODY"]
             run.font.color.rgb = COLORS["BODY"]
-            
-        elif item["type"] == "table":
-            table_data = item["data"]
-            if len(table_data) > 0:
-                num_cols = len(table_data[0])
-                table = doc.add_table(rows=len(table_data), cols=num_cols)
-                table.alignment = WD_TABLE_ALIGNMENT.CENTER
-                
-                for row_idx, row_data in enumerate(table_data):
-                    row = table.rows[row_idx]
-                    for col_idx, cell_text in enumerate(row_data):
-                        cell = row.cells[col_idx]
-                        cell.text = cell_text
-                        
-                        # Format cell
-                        for para in cell.paragraphs:
-                            for run in para.runs:
-                                run.font.name = 'Aptos'
-                                run.font.size = SIZES["BODY"]
-                        
-                        # Set borders
-                        set_cell_borders(cell)
-                        
-                        # Header row styling
-                        if row_idx == 0:
-                            set_cell_shading(cell, "1F4E79")
-                            for para in cell.paragraphs:
-                                para.alignment = WD_ALIGN_PARAGRAPH.CENTER
-                                for run in para.runs:
-                                    run.font.bold = True
-                                    run.font.color.rgb = COLORS["WHITE"]
-                
-                doc.add_paragraph()  # Space after table
+        
+        elif item_type == "code_block":
+            doc.add_paragraph()  # Space before
+            create_code_block_table(doc, item["lines"])
+            doc.add_paragraph()  # Space after
+        
+        elif item_type == "table":
+            doc.add_paragraph()  # Space before
+            create_data_table(doc, item["data"])
+            doc.add_paragraph()  # Space after
     
-    # --- END OF DOCUMENT ---
+    # ---- END OF DOCUMENT ----
     end_para = doc.add_paragraph()
     end_para.alignment = WD_ALIGN_PARAGRAPH.CENTER
     end_para.paragraph_format.space_before = Twips(400)
@@ -263,7 +557,9 @@ def save_doc_to_bytes(doc):
     return buffer
 
 
-# --- STREAMLIT APP ---
+# ============================================================================
+# STREAMLIT APPLICATION
+# ============================================================================
 
 st.set_page_config(
     page_title="TechTorch Document Formatter",
@@ -271,9 +567,23 @@ st.set_page_config(
     layout="centered"
 )
 
+# Custom CSS
+st.markdown("""
+<style>
+    .stButton > button {
+        width: 100%;
+    }
+    .upload-text {
+        font-size: 14px;
+        color: #666;
+    }
+</style>
+""", unsafe_allow_html=True)
+
 # Header
 st.title("📄 TechTorch Document Formatter")
 st.markdown("Upload a Word document to automatically apply TechTorch formatting standards.")
+st.markdown("*Supports code blocks, tables, section headers, and bullet points.*")
 
 st.divider()
 
@@ -308,6 +618,14 @@ if uploaded_file is not None and doc_title:
                 # Extract content
                 content = extract_content_from_docx(uploaded_file)
                 
+                # Show what was extracted
+                code_blocks = sum(1 for c in content if c["type"] == "code_block")
+                tables = sum(1 for c in content if c["type"] == "table")
+                headings = sum(1 for c in content if c["type"].startswith("heading"))
+                bullets = sum(1 for c in content if c["type"] == "bullet")
+                
+                st.info(f"Extracted: {headings} headings, {bullets} bullet points, {code_blocks} code blocks, {tables} tables")
+                
                 # Create formatted document
                 formatted_doc = create_formatted_document(
                     content, 
@@ -334,6 +652,7 @@ if uploaded_file is not None and doc_title:
                 
             except Exception as e:
                 st.error(f"Error processing document: {str(e)}")
+                st.exception(e)
 
 elif uploaded_file is None:
     st.info("Please upload a Word document to get started.")
@@ -344,7 +663,8 @@ elif not doc_title:
 st.divider()
 st.markdown(
     "<div style='text-align: center; color: #666666; font-size: 12px;'>"
-    "TechTorch Documentation Formatting Tool v1.0"
+    "TechTorch Documentation Formatting Tool v2.0<br>"
+    "Now with code block and table support"
     "</div>",
     unsafe_allow_html=True
 )
